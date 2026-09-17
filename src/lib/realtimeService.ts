@@ -18,7 +18,11 @@ import {
   arrayUnion,
   arrayRemove,
   isFirestoreQuotaExhausted,
+  markFirestoreQuotaExhausted,
+  isServerOnlyModeEnabled,
+  setServerOnlyMode,
 } from './firebase';
+export { isFirestoreQuotaExhausted, markFirestoreQuotaExhausted, isServerOnlyModeEnabled, setServerOnlyMode };
 import { GlobalRealtimeStats, StoryRealtimeStats, RealtimeComment, Story, Chapter, Announcement, ReaderLetter, CommentReply, CollaboratorItem, UserProfile } from '../types';
 export type { ReaderLetter, RealtimeComment, CommentReply, GlobalRealtimeStats, StoryRealtimeStats, CollaboratorItem, UserProfile };
 import {
@@ -35,7 +39,7 @@ import {
 } from '../data/mockData';
 import { buildApiUrl } from './apiConfig';
 import { bgmEngine } from '../utils/audioPlayer';
-import { updateGenresFromRemote } from '../utils/genreManager';
+import { updateGenresFromRemote, getCustomGenres } from '../utils/genreManager';
 
 /**
  * Recursively removes all keys with `undefined` value from objects/arrays,
@@ -66,14 +70,15 @@ export const sanitizeForFirestore = <T>(data: T): T => {
 /**
  * Safe fetch with guaranteed AbortController timeout to prevent hanging UI requests
  */
-export const fetchWithTimeout = async (url: string, options: RequestInit = {}, timeoutMs = 3000): Promise<Response> => {
+export const fetchWithTimeout = async (url: string, options: RequestInit = {}, timeoutMs = 4000): Promise<Response> => {
   if (typeof window === 'undefined') {
     return Promise.reject(new Error('Window undefined'));
   }
+  const resolvedUrl = url.startsWith('/') ? buildApiUrl(url) : url;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { ...options, signal: controller.signal });
+    const res = await fetch(resolvedUrl, { ...options, signal: controller.signal });
     return res;
   } finally {
     clearTimeout(timer);
@@ -90,12 +95,15 @@ export const withTimeout = <T>(promise: Promise<T>, timeoutMs = 3500): Promise<T
   ]);
 };
 
-// --- Firestore Quota Breaker ---
+// --- Firestore Quota Breaker & Server-First Unlimited Mode ---
 // If Firestore hits daily quota (RESOURCE_EXHAUSTED), prevent hanging and fall back instantly to Server REST + SSE
 let isFirestoreQuotaBlocked = false;
 let quotaBlockedUntil = 0;
 
 export const checkIsFirestoreBlocked = (): boolean => {
+  if (isFirestoreQuotaExhausted()) {
+    return true;
+  }
   if (isFirestoreQuotaBlocked && Date.now() < quotaBlockedUntil) {
     return true;
   }
@@ -112,18 +120,20 @@ export const flagFirestoreQuotaExceeded = (err?: any) => {
     msg.includes('resource-exhausted')
   ) {
     isFirestoreQuotaBlocked = true;
-    quotaBlockedUntil = Date.now() + 15 * 60 * 1000; // 15 minutes backoff
-    console.warn('[Firestore] Quota limit active. Operating seamlessly in Server REST + SSE mode.');
+    quotaBlockedUntil = Date.now() + 24 * 60 * 60 * 1000; // 24h backoff
+    markFirestoreQuotaExhausted();
+    console.warn('[Firestore] Quota limit active. Operating seamlessly in Server REST + SSE mode (Unlimited).');
   }
 };
 
 /**
- * Parses timestamps safely, properly handling Vietnamese friendly strings like "Vừa đăng" / "Vừa cập nhật"
+ * Parses timestamps safely. Static friendly strings like "Vừa đăng" / "Vừa cập nhật"
+ * return a small past baseline timestamp so that any real server publication timestamp takes priority.
  */
 export const parseSafeTimestamp = (dateStr?: string): number => {
   if (!dateStr) return 0;
   if (dateStr === 'Vừa đăng' || dateStr === 'Vừa cập nhật' || dateStr.includes('Vừa')) {
-    return Date.now();
+    return 1; // Small baseline timestamp so real updates take precedence
   }
   const parsed = new Date(dateStr).getTime();
   if (!isNaN(parsed) && parsed > 0) return parsed;
@@ -414,28 +424,15 @@ export const initServerRealtimeSync = () => {
             currentMap.set(s.id, s);
             updated = true;
           } else {
-            const existingTime = parseSafeTimestamp(existing.updatedAt);
-            const incomingTime = parseSafeTimestamp(s.updatedAt);
-            const isDifferent =
-              s.title !== existing.title ||
-              s.completedChapters !== existing.completedChapters ||
-              s.totalChapters !== existing.totalChapters ||
-              s.status !== existing.status ||
-              s.coverImage !== existing.coverImage ||
-              s.hasPassword !== existing.hasPassword ||
-              s.passwordKey !== existing.passwordKey ||
-              s.summary !== existing.summary;
-
-            if (incomingTime >= existingTime || isDifferent) {
-              currentMap.set(s.id, {
-                ...existing,
-                ...s,
-                views: Math.max(Number(existing.views) || 0, Number(s.views) || 0),
-                likes: Math.max(Number(existing.likes) || 0, Number(s.likes) || 0),
-                completedChapters: Math.max(Number(existing.completedChapters) || 0, Number(s.completedChapters) || 0),
-              });
-              updated = true;
-            }
+            // Server story is authoritative for publication data
+            currentMap.set(s.id, {
+              ...existing,
+              ...s,
+              views: Math.max(Number(existing.views) || 0, Number(s.views) || 0),
+              likes: Math.max(Number(existing.likes) || 0, Number(s.likes) || 0),
+              completedChapters: Math.max(Number(existing.completedChapters) || 0, Number(s.completedChapters) || 0),
+            });
+            updated = true;
           }
         }
 
@@ -750,6 +747,12 @@ export const initServerRealtimeSync = () => {
           if (Array.isArray(msg.payload)) {
             updateGenresFromRemote(msg.payload);
           }
+        } else if (
+          msg.type === 'data_imported' ||
+          msg.type === 'stories_synced' ||
+          msg.type === 'chapters_synced'
+        ) {
+          pullServerSync();
         } else if (msg.type === 'active_readers' && typeof msg.payload?.count === 'number') {
           currentLiveActiveReaders = Math.max(1, msg.payload.count);
           activeReaderSubscribers.forEach((cb) => {
@@ -2141,7 +2144,7 @@ export const subscribeToPublishedStories = (
 
   // 3. Immediately pull from server API for multi-device cross-session sync
   if (typeof window !== 'undefined') {
-    fetch('/api/stories')
+    fetch(buildApiUrl('/api/stories'))
       .then((res) => (res.ok ? res.json() : null))
       .then((serverStories) => {
         if (Array.isArray(serverStories) && serverStories.length > 0) {
@@ -2161,28 +2164,15 @@ export const subscribeToPublishedStories = (
               currentMap.set(s.id, s);
               changed = true;
             } else {
-              const existingTime = parseSafeTimestamp(existing.updatedAt);
-              const incomingTime = parseSafeTimestamp(s.updatedAt);
-              const isDifferent =
-                s.title !== existing.title ||
-                s.completedChapters !== existing.completedChapters ||
-                s.totalChapters !== existing.totalChapters ||
-                s.status !== existing.status ||
-                s.coverImage !== existing.coverImage ||
-                s.hasPassword !== existing.hasPassword ||
-                s.passwordKey !== existing.passwordKey ||
-                s.summary !== existing.summary;
-
-              if (incomingTime >= existingTime || isDifferent) {
-                currentMap.set(s.id, {
-                  ...existing,
-                  ...s,
-                  views: Math.max(Number(existing.views) || 0, Number(s.views) || 0),
-                  likes: Math.max(Number(existing.likes) || 0, Number(s.likes) || 0),
-                  completedChapters: Math.max(Number(existing.completedChapters) || 0, Number(s.completedChapters) || 0),
-                });
-                changed = true;
-              }
+              // Server is authoritative source for published stories, retain maximum local metrics
+              currentMap.set(s.id, {
+                ...existing,
+                ...s,
+                views: Math.max(Number(existing.views) || 0, Number(s.views) || 0),
+                likes: Math.max(Number(existing.likes) || 0, Number(s.likes) || 0),
+                completedChapters: Math.max(Number(existing.completedChapters) || 0, Number(s.completedChapters) || 0),
+              });
+              changed = true;
             }
           }
           if (changed) {
@@ -2572,7 +2562,7 @@ export const subscribeToAllChapters = (
 
   // 2. Fetch from server API immediately for multi-device sync
   if (typeof window !== 'undefined') {
-    fetch('/api/chapters')
+    fetch(buildApiUrl('/api/chapters'))
       .then((res) => (res.ok ? res.json() : null))
       .then((chaptersMap) => {
         if (chaptersMap && typeof chaptersMap === 'object') {
@@ -2669,7 +2659,7 @@ export const subscribeToAllChapters = (
 
           // Keep server API synced in background
           if (typeof window !== 'undefined') {
-            fetch('/api/sync', {
+            fetch(buildApiUrl('/api/sync'), {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ chapters: fullCache }),
@@ -2720,7 +2710,7 @@ export const subscribeToStoryChapters = (
 
   // 3. Immediately query Server API for real-time consistency across devices
   if (typeof window !== 'undefined') {
-    fetch(`/api/chapters?storyId=${encodeURIComponent(storyId)}`)
+    fetch(buildApiUrl(`/api/chapters?storyId=${encodeURIComponent(storyId)}`))
       .then((res) => (res.ok ? res.json() : null))
       .then((serverList) => {
         if (Array.isArray(serverList) && serverList.length > 0) {
@@ -3036,7 +3026,7 @@ export const subscribeToAnnouncements = (
 
   // 3. Immediately pull from Server API
   if (typeof window !== 'undefined') {
-    fetch('/api/announcements')
+    fetch(buildApiUrl('/api/announcements'))
       .then((res) => (res.ok ? res.json() : null))
       .then((serverAnn) => {
         if (Array.isArray(serverAnn) && serverAnn.length > 0) {
@@ -3146,15 +3136,26 @@ export const deleteAnnouncement = async (announcementId: string): Promise<void> 
 
   const tasks: Promise<any>[] = [];
 
-  const firestoreDel = async () => {
-    try {
-      await deleteDoc(doc(db, 'announcements', announcementId));
-    } catch (firestoreErr) {
-      console.warn('Firestore announcement delete warning:', firestoreErr);
-    }
-  };
+  // 1. Server API deletion
+  tasks.push(
+    fetchWithTimeout(`/api/announcements/${encodeURIComponent(announcementId)}`, {
+      method: 'DELETE',
+    }, 4000).catch((apiErr) => {
+      console.warn('Server API announcement delete warning:', apiErr);
+    })
+  );
 
-  tasks.push(withTimeout(firestoreDel(), 3500).catch((err) => console.warn('Firestore delete announcement timeout:', err)));
+  // 2. Firestore deletion (if quota healthy)
+  if (!checkIsFirestoreBlocked()) {
+    const firestoreDel = async () => {
+      try {
+        await deleteDoc(doc(db, 'announcements', announcementId));
+      } catch (firestoreErr) {
+        console.warn('Firestore announcement delete warning:', firestoreErr);
+      }
+    };
+    tasks.push(withTimeout(firestoreDel(), 3500).catch((err) => console.warn('Firestore delete announcement timeout:', err)));
+  }
 
   await Promise.allSettled(tasks);
 };
@@ -3810,5 +3811,164 @@ export const saveUserAccount = async (account: StoredUserAccount): Promise<void>
     await registerUsernameMapping(account.username, account.email, account.uid);
   }
 };
+
+/**
+ * Triggers a download of the full website backup JSON file (Stories, Chapters, Announcements, Letters, Comments, Genres)
+ */
+export const exportFullWebsiteBackup = async (): Promise<void> => {
+  try {
+    const res = await fetch(buildApiUrl('/api/backup/export'));
+    if (res.ok) {
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `mellifluous-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      window.URL.revokeObjectURL(url);
+      return;
+    }
+  } catch (err) {
+    console.warn('Server backup export failed, falling back to client-assembled backup:', err);
+  }
+
+  // Fallback if server unreachable: assemble from localStorage & runtime cache
+  try {
+    const clientBackup = {
+      version: '1.0',
+      exportedAt: new Date().toISOString(),
+      source: 'Mellifluous-Client',
+      stories: getStoredStories(),
+      chapters: getLiveChaptersRuntimeCache(),
+      announcements: getStoredAnnouncements(),
+      letters: getStoredReaderLetters(),
+      genres: getCustomGenres(),
+    };
+    const blob = new Blob([JSON.stringify(clientBackup, null, 2)], { type: 'application/json' });
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `mellifluous-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(url);
+  } catch (err) {
+    console.error('Client backup export error:', err);
+    throw err;
+  }
+};
+
+/**
+ * Restores all website data from a backup JSON object (stories, chapters, announcements, letters, etc.)
+ */
+export const importFullWebsiteBackup = async (
+  backupData: any
+): Promise<{ stories: number; chapters: number; announcements: number }> => {
+  if (!backupData || typeof backupData !== 'object') {
+    throw new Error('Dữ liệu sao lưu không hợp lệ. Vui lòng chọn tệp .json hợp lệ.');
+  }
+
+  // 1. Send to server for authoritative persistence & disk writing
+  try {
+    await fetch(buildApiUrl('/api/backup/import'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(backupData),
+    });
+  } catch (err) {
+    console.warn('Server backup import warning:', err);
+  }
+
+  // 2. Restore client localStorage & notify active listeners immediately
+  let storyCount = 0;
+  let chapterCount = 0;
+  let announcementCount = 0;
+
+  if (Array.isArray(backupData.stories) && backupData.stories.length > 0) {
+    try {
+      localStorage.setItem('mel_published_stories', JSON.stringify(backupData.stories));
+    } catch {}
+    notifyStorySubscribers(backupData.stories);
+    storyCount = backupData.stories.length;
+  }
+
+  if (backupData.chapters && typeof backupData.chapters === 'object') {
+    for (const [storyId, list] of Object.entries(backupData.chapters)) {
+      if (Array.isArray(list)) {
+        try {
+          localStorage.setItem(`mel_chapters_${storyId}`, JSON.stringify(list));
+        } catch {}
+        setLiveStoryChapters(storyId, list);
+        notifyChapterSubscribers(storyId, list);
+        chapterCount += list.length;
+      }
+    }
+    activeAllChaptersSubscribers.forEach((cb) => {
+      try {
+        cb(getLiveChaptersRuntimeCache());
+      } catch {}
+    });
+  }
+
+  if (Array.isArray(backupData.announcements) && backupData.announcements.length > 0) {
+    try {
+      localStorage.setItem('mel_announcements', JSON.stringify(backupData.announcements));
+    } catch {}
+    notifyAnnouncementSubscribers(backupData.announcements);
+    announcementCount = backupData.announcements.length;
+  }
+
+  if (Array.isArray(backupData.letters) && backupData.letters.length > 0) {
+    saveStoredReaderLetters(backupData.letters);
+    notifyReaderLetterSubscribers(backupData.letters);
+  }
+
+  if (Array.isArray(backupData.genres) && backupData.genres.length > 0) {
+    updateGenresFromRemote(backupData.genres);
+  }
+
+  return {
+    stories: storyCount,
+    chapters: chapterCount,
+    announcements: announcementCount,
+  };
+};
+
+/**
+ * Force manual bidirectional sync with server API
+ */
+export const forceSyncWithServer = async (): Promise<boolean> => {
+  try {
+    // 1. Push any local stories and chapters to server
+    const localStories = getStoredStories();
+    const localChapters = getLiveChaptersRuntimeCache();
+    await fetch(buildApiUrl('/api/sync'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        stories: localStories,
+        chapters: localChapters,
+      }),
+    });
+
+    // 2. Fetch fresh snapshot
+    const res = await fetch(buildApiUrl('/api/sync'));
+    if (res.ok) {
+      const data = await res.json();
+      if (data.stories && Array.isArray(data.stories)) {
+        notifyStorySubscribers(data.stories);
+      }
+      return true;
+    }
+    return false;
+  } catch (err) {
+    console.error('Force sync error:', err);
+    return false;
+  }
+};
+
 
 

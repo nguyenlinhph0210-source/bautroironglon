@@ -77,21 +77,56 @@ googleProvider.setCustomParameters({ prompt: 'select_account' });
 // Ensures Firestore network is always active and user content writes always execute.
 // ============================================================================
 
-// Clean up any stale quota locks from previous sessions
+// State tracking for Firestore Quota status
+let isQuotaExhaustedFlag = false;
+
+// Check stored quota status from previous errors
 if (typeof window !== 'undefined') {
   try {
-    sessionStorage.removeItem('mel_fs_quota_exceeded');
-    localStorage.removeItem('mel_fs_quota_exceeded');
-  } catch {}
-  try {
-    enableNetwork(db).catch(() => {});
+    const until = Number(localStorage.getItem('mel_fs_quota_exceeded') || '0');
+    if (until > Date.now()) {
+      isQuotaExhaustedFlag = true;
+    }
   } catch {}
 }
 
-export const isFirestoreQuotaExhausted = (): boolean => false;
+export const isServerOnlyModeEnabled = (): boolean => {
+  if (typeof window === 'undefined') return false;
+  return localStorage.getItem('mel_force_server_only') === 'true';
+};
+
+export const setServerOnlyMode = (enabled: boolean) => {
+  if (typeof window === 'undefined') return;
+  if (enabled) {
+    localStorage.setItem('mel_force_server_only', 'true');
+  } else {
+    localStorage.removeItem('mel_force_server_only');
+  }
+  window.dispatchEvent(new CustomEvent('engine_mode_changed', { detail: { serverOnly: enabled } }));
+};
+
+export const isFirestoreQuotaExhausted = (): boolean => {
+  if (isServerOnlyModeEnabled()) return true;
+  if (isQuotaExhaustedFlag) return true;
+  if (typeof window !== 'undefined') {
+    const until = Number(localStorage.getItem('mel_fs_quota_exceeded') || '0');
+    if (until > Date.now()) {
+      isQuotaExhaustedFlag = true;
+      return true;
+    }
+  }
+  return false;
+};
 
 export const markFirestoreQuotaExhausted = () => {
-  console.warn('[Firestore] Notice: Write operation quota warning received from Google Cloud.');
+  isQuotaExhaustedFlag = true;
+  if (typeof window !== 'undefined') {
+    try {
+      localStorage.setItem('mel_fs_quota_exceeded', String(Date.now() + 24 * 60 * 60 * 1000));
+      window.dispatchEvent(new CustomEvent('firestore_quota_exhausted'));
+    } catch {}
+  }
+  console.warn('[Firestore] Project reached free daily quota. Operating seamlessly via Server Engine (Unlimited).');
 };
 
 export const checkAndHandleQuotaError = (err: any): boolean => {
@@ -102,9 +137,12 @@ export const checkAndHandleQuotaError = (err: any): boolean => {
     code === 'resource-exhausted' ||
     msg.includes('resource-exhausted') ||
     msg.includes('Quota limit exceeded') ||
+    msg.includes('Quota exceeded') ||
+    msg.includes('quota') ||
+    msg.includes('Quota') ||
     msg.includes('Free daily write units')
   ) {
-    console.warn('[Firestore] Daily free write quota reached on project. Attempting graceful fallback:', err);
+    markFirestoreQuotaExhausted();
     return true;
   }
   return false;

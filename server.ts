@@ -161,6 +161,118 @@ app.post('/api/sync', (req: Request, res: Response) => {
   }
 });
 
+// Full export of all website data (Backup JSON)
+app.get('/api/backup/export', (req: Request, res: Response) => {
+  try {
+    const backup = {
+      version: '1.0',
+      exportedAt: new Date().toISOString(),
+      source: 'Mellifluous-Website',
+      stories: getAllStories(),
+      chapters: getAllChaptersMap(),
+      announcements: getAllAnnouncements(),
+      tracks: getAllTracks(),
+      letters: getAllLetters(),
+      genres: getAllGenres(),
+      comments: getAllComments(),
+    };
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename="mellifluous-backup-${new Date().toISOString().slice(0, 10)}.json"`);
+    res.json(backup);
+  } catch (err: any) {
+    console.error('Backup export error:', err);
+    res.status(500).json({ error: 'Failed to export backup: ' + err.message });
+  }
+});
+
+// Full import of website data from Backup JSON (Restore)
+app.post('/api/backup/import', (req: Request, res: Response) => {
+  try {
+    const backup = req.body;
+    if (!backup || typeof backup !== 'object') {
+      res.status(400).json({ error: 'Invalid backup format. Must be a JSON object.' });
+      return;
+    }
+    let storyCount = 0;
+    let chapterCount = 0;
+    let announcementCount = 0;
+
+    if (Array.isArray(backup.stories)) {
+      backup.stories.forEach((s: any) => {
+        if (s && s.id && s.title) {
+          saveStory(s);
+          storyCount++;
+        }
+      });
+    }
+
+    if (backup.chapters && typeof backup.chapters === 'object') {
+      for (const [storyId, list] of Object.entries(backup.chapters)) {
+        if (Array.isArray(list)) {
+          list.forEach((ch: any) => {
+            if (ch && ch.id && ch.title) {
+              saveChapter(ch);
+              chapterCount++;
+            }
+          });
+        }
+      }
+    }
+
+    if (Array.isArray(backup.announcements)) {
+      backup.announcements.forEach((a: any) => {
+        if (a && a.id && a.title) {
+          saveAnnouncement(a);
+          announcementCount++;
+        }
+      });
+    }
+
+    if (Array.isArray(backup.tracks)) {
+      backup.tracks.forEach((t: any) => {
+        if (t && t.id) saveTrack(t);
+      });
+    }
+
+    if (Array.isArray(backup.letters)) {
+      backup.letters.forEach((l: any) => {
+        if (l && l.id) saveLetter(l);
+      });
+    }
+
+    if (Array.isArray(backup.comments)) {
+      backup.comments.forEach((c: any) => {
+        if (c && c.id) saveComment(c);
+      });
+    }
+
+    if (Array.isArray(backup.genres)) {
+      saveGenres(backup.genres);
+    }
+
+    broadcastEvent('data_imported', {
+      timestamp: Date.now(),
+      storyCount,
+      chapterCount,
+      announcementCount,
+    });
+    broadcastEvent('stories_synced', { count: storyCount });
+
+    res.json({
+      success: true,
+      restored: {
+        stories: storyCount,
+        chapters: chapterCount,
+        announcements: announcementCount,
+      },
+      timestamp: Date.now(),
+    });
+  } catch (err: any) {
+    console.error('Backup import error:', err);
+    res.status(500).json({ error: 'Failed to import backup: ' + err.message });
+  }
+});
+
 // Active readers endpoint
 app.get('/api/active-readers', (req: Request, res: Response) => {
   res.json({ count: Math.max(1, sseClients.length) });
@@ -255,6 +367,10 @@ app.post('/api/chapters', (req: Request, res: Response) => {
     }
     const saved = saveChapter(chapter);
     broadcastEvent('chapter_saved', saved);
+    const updatedStory = getStoryById(chapter.storyId);
+    if (updatedStory) {
+      broadcastEvent('story_saved', updatedStory);
+    }
     res.json({ success: true, chapter: saved });
   } catch (err: any) {
     console.error('Error saving chapter:', err);
@@ -272,6 +388,10 @@ app.delete('/api/chapters/:id', (req: Request, res: Response) => {
     }
     deleteChapter(storyId, id);
     broadcastEvent('chapter_deleted', { id, storyId });
+    const updatedStory = getStoryById(storyId);
+    if (updatedStory) {
+      broadcastEvent('story_saved', updatedStory);
+    }
     res.json({ success: true });
   } catch (err: any) {
     console.error('Error deleting chapter:', err);

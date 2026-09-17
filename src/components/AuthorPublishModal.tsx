@@ -32,6 +32,11 @@ import {
   RefreshCw,
   Search,
   Plus,
+  Download,
+  Database,
+  HardDrive,
+  Server,
+  CloudOff,
 } from 'lucide-react';
 import {
   publishStory,
@@ -41,6 +46,12 @@ import {
   replyToReaderLetter,
   deleteReaderLetter,
   resetAllMetricsToZero,
+  exportFullWebsiteBackup,
+  importFullWebsiteBackup,
+  forceSyncWithServer,
+  isServerOnlyModeEnabled,
+  setServerOnlyMode,
+  isFirestoreQuotaExhausted,
 } from '../lib/realtimeService';
 import { useAuth } from '../lib/authContext';
 import { AuthorMusicTab } from './author/AuthorMusicTab';
@@ -129,6 +140,26 @@ export const AuthorPublishModal: React.FC<AuthorPublishModalProps> = ({
   const [isSendingReply, setIsSendingReply] = useState(false);
   const [letterToDelete, setLetterToDelete] = useState<string | null>(null);
   const [storyToDelete, setStoryToDelete] = useState<{ id: string; title: string } | null>(null);
+
+  // Storage Engine, Sync & Backup States
+  const [isServerOnly, setIsServerOnly] = useState<boolean>(() => isServerOnlyModeEnabled());
+  const [isQuotaExhausted, setIsQuotaExhausted] = useState<boolean>(() => isFirestoreQuotaExhausted());
+  const [isSyncingServer, setIsSyncingServer] = useState(false);
+  const [isBackingUp, setIsBackingUp] = useState(false);
+  const [isRestoring, setIsRestoring] = useState(false);
+
+  useEffect(() => {
+    const handleQuota = () => setIsQuotaExhausted(true);
+    const handleEngine = (e: any) => {
+      setIsServerOnly(Boolean(e.detail?.serverOnly));
+    };
+    window.addEventListener('firestore_quota_exhausted', handleQuota);
+    window.addEventListener('engine_mode_changed', handleEngine);
+    return () => {
+      window.removeEventListener('firestore_quota_exhausted', handleQuota);
+      window.removeEventListener('engine_mode_changed', handleEngine);
+    };
+  }, []);
 
   useEffect(() => {
     if (!isOpen || !isAuthor) return;
@@ -1373,6 +1404,159 @@ export const AuthorPublishModal: React.FC<AuthorPublishModalProps> = ({
           {/* TAB 10: QUẢN LÝ TỔNG QUAN */}
           {activeTab === 'manage' && (
             <div className="space-y-4">
+              {/* Unlimited Storage Engine & Firestore Quota Resilience Card */}
+              <div className="p-4 sm:p-5 rounded-2xl bg-emerald-50/90 dark:bg-stone-800 border border-emerald-200/90 dark:border-stone-700 space-y-4 shadow-2xs">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div className="flex items-start gap-3">
+                    <div className="p-2.5 rounded-xl bg-emerald-600 text-white shrink-0 mt-0.5 shadow-2xs">
+                      <Server className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h4 className="font-serif text-sm font-bold text-emerald-950 dark:text-emerald-200">
+                          Động cơ Đăng tải & Lưu trữ Không giới hạn (Server Engine)
+                        </h4>
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 dark:bg-emerald-950 text-emerald-700 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-800">
+                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                          <span>Đang hoạt động (Không phụ thuộc hạn mức Google Cloud)</span>
+                        </span>
+                      </div>
+                      <p className="text-xs text-stone-600 dark:text-stone-300 mt-1 max-w-2xl leading-relaxed">
+                        Website trang bị cơ chế Đa tầng (Triple-Layer). Khi hạn mức Firestore miễn phí cạn kiệt, hệ thống tự động duy trì đăng truyện, chương, thông báo qua <strong>Server REST + SSE</strong> với dung lượng không giới hạn, đồng bộ lập tức cho mọi độc giả.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0 self-end sm:self-auto">
+                    <button
+                      type="button"
+                      disabled={isSyncingServer}
+                      onClick={async () => {
+                        setIsSyncingServer(true);
+                        try {
+                          const ok = await forceSyncWithServer();
+                          if (ok) {
+                            showFeedback('success', 'Đồng bộ 2 chiều với máy chủ thành công!');
+                          } else {
+                            showFeedback('error', 'Đồng bộ chưa hoàn tất, vui lòng thử lại.');
+                          }
+                        } catch (err: any) {
+                          showFeedback('error', 'Lỗi đồng bộ: ' + (err.message || 'Không rõ'));
+                        } finally {
+                          setIsSyncingServer(false);
+                        }
+                      }}
+                      className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-xs font-bold shrink-0 cursor-pointer shadow-2xs flex items-center gap-1.5 transition-colors"
+                      title="Ép đồng bộ tức thì với máy chủ"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${isSyncingServer ? 'animate-spin' : ''}`} />
+                      <span>{isSyncingServer ? 'Đang đồng bộ...' : 'Đồng bộ ngay'}</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Quota Exhaustion Warning / Banner if active */}
+                {isQuotaExhausted && (
+                  <div className="p-3 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-900/60 flex items-start gap-2.5 text-xs text-amber-800 dark:text-amber-200">
+                    <CloudOff className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                    <div className="space-y-0.5">
+                      <p className="font-bold">Đã kích hoạt chế độ Server Độc Lập do hạn mức miễn phí Firestore cạn kiệt:</p>
+                      <p className="text-stone-600 dark:text-stone-300">
+                        Mọi thao tác xuất bản truyện, chương, đổi thể loại, đăng thông báo vẫn hoạt động bình thường qua Server máy chủ của bạn mà không hề bị ngắt quãng!
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {/* Engine Mode Toggle & Backup Action Buttons */}
+                <div className="pt-2 border-t border-emerald-200/60 dark:border-stone-700 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <label className="flex items-center gap-2 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={isServerOnly}
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        setIsServerOnly(checked);
+                        setServerOnlyMode(checked);
+                        showFeedback(
+                          'success',
+                          checked
+                            ? 'Đã bật chế độ Server Độc Lập (Bỏ qua hoàn toàn Firestore).'
+                            : 'Đã hoàn tất chuyển về chế độ Đa tầng mặc định.'
+                        );
+                      }}
+                      className="rounded border-stone-300 text-emerald-600 focus:ring-emerald-500 w-4 h-4 cursor-pointer"
+                    />
+                    <span className="text-xs font-medium text-stone-700 dark:text-stone-300">
+                      Ưu tiên máy chủ độc lập (Server-First Mode - Tránh mọi lỗi quota)
+                    </span>
+                  </label>
+
+                  {/* Backup & Restore Buttons */}
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={isBackingUp}
+                      onClick={async () => {
+                        setIsBackingUp(true);
+                        try {
+                          await exportFullWebsiteBackup();
+                          showFeedback('success', 'Đã tải về tệp sao lưu toàn bộ dữ liệu website (.json)!');
+                        } catch (err: any) {
+                          showFeedback('error', 'Lỗi xuất sao lưu: ' + (err.message || ''));
+                        } finally {
+                          setIsBackingUp(false);
+                        }
+                      }}
+                      className="px-3 py-1.5 rounded-xl bg-white dark:bg-stone-700 hover:bg-stone-100 dark:hover:bg-stone-600 text-stone-700 dark:text-stone-200 border border-stone-200 dark:border-stone-600 text-xs font-semibold flex items-center gap-1.5 cursor-pointer shadow-2xs transition-colors"
+                      title="Xuất toàn bộ truyện, chương, thông báo ra file .json"
+                    >
+                      <Download className={`w-3.5 h-3.5 text-emerald-600 ${isBackingUp ? 'animate-bounce' : ''}`} />
+                      <span>{isBackingUp ? 'Đang xuất...' : 'Tải sao lưu (.json)'}</span>
+                    </button>
+
+                    <label
+                      className={`px-3 py-1.5 rounded-xl bg-white dark:bg-stone-700 hover:bg-stone-100 dark:hover:bg-stone-600 text-stone-700 dark:text-stone-200 border border-stone-200 dark:border-stone-600 text-xs font-semibold flex items-center gap-1.5 cursor-pointer shadow-2xs transition-colors ${
+                        isRestoring ? 'opacity-50 pointer-events-none' : ''
+                      }`}
+                      title="Khôi phục website từ file .json sao lưu trước đó"
+                    >
+                      <Upload className={`w-3.5 h-3.5 text-pink-600 ${isRestoring ? 'animate-spin' : ''}`} />
+                      <span>{isRestoring ? 'Đang nạp...' : 'Khôi phục (.json)'}</span>
+                      <input
+                        type="file"
+                        accept=".json,application/json"
+                        className="hidden"
+                        onChange={async (e) => {
+                          const file = e.target.files?.[0];
+                          if (!file) return;
+                          if (!confirm(`Khôi phục dữ liệu từ "${file.name}"? Dữ liệu hiện có sẽ được cập nhật và đồng bộ.`)) {
+                            e.target.value = '';
+                            return;
+                          }
+                          setIsRestoring(true);
+                          try {
+                            const text = await file.text();
+                            const parsed = JSON.parse(text);
+                            const result = await importFullWebsiteBackup(parsed);
+                            showFeedback(
+                              'success',
+                              `Khôi phục thành công! Đã nạp ${result.stories} truyện, ${result.chapters} chương, ${result.announcements} thông báo.`
+                            );
+                            if (onStoriesUpdated) onStoriesUpdated();
+                          } catch (err: any) {
+                            showFeedback('error', 'Lỗi tệp sao lưu: ' + (err.message || 'Sai định dạng JSON'));
+                          } finally {
+                            setIsRestoring(false);
+                            e.target.value = '';
+                          }
+                        }}
+                      />
+                    </label>
+                  </div>
+                </div>
+              </div>
+
               {/* Metric Reset to 0 (Official site launch feature) */}
               <div className="p-4 sm:p-5 rounded-2xl bg-amber-50/80 dark:bg-stone-800 border border-amber-200 dark:border-stone-700 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-2xs">
                 <div>
