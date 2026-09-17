@@ -23,6 +23,33 @@ import {
   setServerOnlyMode,
 } from './firebase';
 export { isFirestoreQuotaExhausted, markFirestoreQuotaExhausted, isServerOnlyModeEnabled, setServerOnlyMode };
+import {
+  getRtdbClient,
+  isRtdbEnabled,
+  getGitHubStorageConfig,
+  fetchFromGitHubGist,
+  saveToGitHubGist,
+  fetchStaticBundledStories,
+  fetchStaticBundledChapters,
+  fetchStaticBundledAnnouncements,
+  saveCustomRtdbUrl,
+  getCustomRtdbUrl,
+  setRtdbEnabled,
+  saveGitHubStorageConfig,
+  createGitHubGistDatabase,
+  testRtdbConnection,
+} from './alternativeCloudStorage';
+export {
+  saveCustomRtdbUrl,
+  getCustomRtdbUrl,
+  isRtdbEnabled,
+  setRtdbEnabled,
+  getGitHubStorageConfig,
+  saveGitHubStorageConfig,
+  createGitHubGistDatabase,
+  testRtdbConnection,
+};
+import { ref as rtdbRef, set as rtdbSet, remove as rtdbRemove, onValue as rtdbOnValue } from 'firebase/database';
 import { GlobalRealtimeStats, StoryRealtimeStats, RealtimeComment, Story, Chapter, Announcement, ReaderLetter, CommentReply, CollaboratorItem, UserProfile } from '../types';
 export type { ReaderLetter, RealtimeComment, CommentReply, GlobalRealtimeStats, StoryRealtimeStats, CollaboratorItem, UserProfile };
 import {
@@ -2142,50 +2169,88 @@ export const subscribeToPublishedStories = (
   // 2. Register for local broadcasts
   activeStorySubscribers.add(callback);
 
-  // 3. Immediately pull from server API for multi-device cross-session sync
+  const syncExternalStories = (sourceStories: Story[]) => {
+    if (!Array.isArray(sourceStories) || sourceStories.length === 0) return;
+    const current = getStoredStories();
+    const currentMap = new Map(current.map((s) => [s.id, s]));
+    let changed = false;
+    let localDel = new Set<string>();
+    try {
+      const raw = localStorage.getItem('mel_deleted_story_ids');
+      if (raw) localDel = new Set(JSON.parse(raw));
+    } catch {}
+
+    for (const s of sourceStories) {
+      if (localDel.has(s.id)) continue;
+      const existing = currentMap.get(s.id);
+      if (!existing) {
+        currentMap.set(s.id, s);
+        changed = true;
+      } else {
+        currentMap.set(s.id, {
+          ...existing,
+          ...s,
+          views: Math.max(Number(existing.views) || 0, Number(s.views) || 0),
+          likes: Math.max(Number(existing.likes) || 0, Number(s.likes) || 0),
+          completedChapters: Math.max(Number(existing.completedChapters) || 0, Number(s.completedChapters) || 0),
+        });
+        changed = true;
+      }
+    }
+    if (changed) {
+      const merged = Array.from(currentMap.values());
+      try {
+        localStorage.setItem('mel_published_stories', JSON.stringify(merged));
+      } catch {}
+      callback(merged);
+      notifyStorySubscribers(merged);
+    }
+  };
+
+  // 3. Pull from server API / Static Bundled Repo Data
   if (typeof window !== 'undefined') {
     fetch(buildApiUrl('/api/stories'))
       .then((res) => (res.ok ? res.json() : null))
-      .then((serverStories) => {
+      .then(async (serverStories) => {
         if (Array.isArray(serverStories) && serverStories.length > 0) {
-          const current = getStoredStories();
-          const currentMap = new Map(current.map((s) => [s.id, s]));
-          let changed = false;
-          let localDel = new Set<string>();
-          try {
-            const raw = localStorage.getItem('mel_deleted_story_ids');
-            if (raw) localDel = new Set(JSON.parse(raw));
-          } catch {}
-
-          for (const s of serverStories) {
-            if (localDel.has(s.id)) continue;
-            const existing = currentMap.get(s.id);
-            if (!existing) {
-              currentMap.set(s.id, s);
-              changed = true;
-            } else {
-              // Server is authoritative source for published stories, retain maximum local metrics
-              currentMap.set(s.id, {
-                ...existing,
-                ...s,
-                views: Math.max(Number(existing.views) || 0, Number(s.views) || 0),
-                likes: Math.max(Number(existing.likes) || 0, Number(s.likes) || 0),
-                completedChapters: Math.max(Number(existing.completedChapters) || 0, Number(s.completedChapters) || 0),
-              });
-              changed = true;
-            }
-          }
-          if (changed) {
-            const merged = Array.from(currentMap.values());
-            try {
-              localStorage.setItem('mel_published_stories', JSON.stringify(merged));
-            } catch {}
-            callback(merged);
-            notifyStorySubscribers(merged);
-          }
+          syncExternalStories(serverStories);
+        } else {
+          const staticStories = await fetchStaticBundledStories();
+          if (staticStories) syncExternalStories(staticStories);
         }
       })
-      .catch(() => {});
+      .catch(async () => {
+        const staticStories = await fetchStaticBundledStories();
+        if (staticStories) syncExternalStories(staticStories);
+      });
+
+    // 3b. Firebase Realtime Database (RTDB) sync
+    if (isRtdbEnabled()) {
+      const rtdb = getRtdbClient();
+      if (rtdb) {
+        try {
+          rtdbOnValue(rtdbRef(rtdb, 'stories'), (snap) => {
+            const val = snap.val();
+            if (val && typeof val === 'object') {
+              const list = Object.values(val) as Story[];
+              if (list.length > 0) syncExternalStories(list);
+            }
+          });
+        } catch (rtdbErr) {
+          console.warn('RTDB stories subscribe note:', rtdbErr);
+        }
+      }
+    }
+
+    // 3c. GitHub Gist Database sync
+    const gh = getGitHubStorageConfig();
+    if (gh.enabled && gh.gistId) {
+      fetchFromGitHubGist().then((data) => {
+        if (data && Array.isArray(data.stories) && data.stories.length > 0) {
+          syncExternalStories(data.stories);
+        }
+      }).catch(() => {});
+    }
   }
 
   // 4. Connect to Firestore story_stats if quota is healthy
@@ -2463,12 +2528,38 @@ export const publishStory = async (story: Story): Promise<void> => {
     syncTasks.push(withTimeout(firestoreSync(), 2500).catch((err) => console.warn('Firestore story timeout:', err)));
   }
 
+  // C. Firebase Realtime Database (RTDB) sync
+  if (isRtdbEnabled()) {
+    const rtdb = getRtdbClient();
+    if (rtdb) {
+      syncTasks.push(
+        rtdbSet(rtdbRef(rtdb, `stories/${cleanStory.id}`), cleanStory).catch((err) =>
+          console.warn('RTDB story save note:', err)
+        )
+      );
+    }
+  }
+
+  // D. GitHub Gist Database sync
+  const gh = getGitHubStorageConfig();
+  if (gh.enabled && gh.token && gh.gistId) {
+    syncTasks.push(
+      (async () => {
+        const current = (await fetchFromGitHubGist()) || {};
+        const currentStories = Array.isArray(current.stories) ? current.stories : [];
+        const filtered = currentStories.filter((s: any) => s.id !== cleanStory.id);
+        filtered.unshift(cleanStory);
+        await saveToGitHubGist({ ...current, stories: filtered });
+      })().catch((err) => console.warn('GitHub Gist story save note:', err))
+    );
+  }
+
   // Safely wait for background tasks without hanging
   await Promise.allSettled(syncTasks);
 };
 
 /**
- * Delete a story with multi-engine persistence (Local + Server API + Firestore).
+ * Delete a story with multi-engine persistence (Local + Server API + Firestore + RTDB + Gist).
  * Guarantees deletion propagates to all devices and clients.
  */
 export const deleteStory = async (storyId: string): Promise<void> => {
@@ -2505,6 +2596,32 @@ export const deleteStory = async (storyId: string): Promise<void> => {
       console.warn('Server API delete story warning:', apiErr);
     })
   );
+
+  // RTDB delete
+  if (isRtdbEnabled()) {
+    const rtdb = getRtdbClient();
+    if (rtdb) {
+      delTasks.push(rtdbRemove(rtdbRef(rtdb, `stories/${storyId}`)).catch(() => {}));
+      delTasks.push(rtdbRemove(rtdbRef(rtdb, `chapters/${storyId}`)).catch(() => {}));
+    }
+  }
+
+  // GitHub Gist delete
+  const ghConfig = getGitHubStorageConfig();
+  if (ghConfig.enabled && ghConfig.token && ghConfig.gistId) {
+    delTasks.push(
+      (async () => {
+        const current = (await fetchFromGitHubGist()) || {};
+        if (Array.isArray(current.stories)) {
+          current.stories = current.stories.filter((s: any) => s.id !== storyId);
+        }
+        if (current.chapters && current.chapters[storyId]) {
+          delete current.chapters[storyId];
+        }
+        await saveToGitHubGist(current);
+      })().catch(() => {})
+    );
+  }
 
   if (!checkIsFirestoreBlocked()) {
     const firestoreDelete = async () => {
@@ -2560,29 +2677,74 @@ export const subscribeToAllChapters = (
   callback(getLiveChaptersRuntimeCache());
   activeAllChaptersSubscribers.add(callback);
 
-  // 2. Fetch from server API immediately for multi-device sync
+  // Helper to ingest and broadcast chapters map
+  const ingestChaptersMap = (chaptersMap: Record<string, Chapter[]>) => {
+    if (!chaptersMap || typeof chaptersMap !== 'object') return;
+    for (const [sId, chList] of Object.entries(chaptersMap)) {
+      if (Array.isArray(chList) && chList.length > 0) {
+        const currentList = getStoryChapters(sId);
+        const merged = mergeChapters(currentList, chList);
+        try {
+          localStorage.setItem(`mel_chapters_${sId}`, JSON.stringify(merged));
+        } catch {}
+        setLiveStoryChapters(sId, merged);
+        notifyChapterSubscribers(sId, merged);
+      }
+    }
+    const fullCache = getLiveChaptersRuntimeCache();
+    callback(fullCache);
+    notifyAllChaptersSubscribers(fullCache);
+  };
+
+  // 2. Fetch from server API / Static Bundled Repo Data
   if (typeof window !== 'undefined') {
     fetch(buildApiUrl('/api/chapters'))
       .then((res) => (res.ok ? res.json() : null))
-      .then((chaptersMap) => {
-        if (chaptersMap && typeof chaptersMap === 'object') {
-          for (const [sId, chList] of Object.entries(chaptersMap as Record<string, Chapter[]>)) {
-            if (Array.isArray(chList) && chList.length > 0) {
-              const currentList = getStoryChapters(sId);
-              const merged = mergeChapters(currentList, chList);
-              try {
-                localStorage.setItem(`mel_chapters_${sId}`, JSON.stringify(merged));
-              } catch {}
-              setLiveStoryChapters(sId, merged);
-              notifyChapterSubscribers(sId, merged);
-            }
-          }
-          const fullCache = getLiveChaptersRuntimeCache();
-          callback(fullCache);
-          notifyAllChaptersSubscribers(fullCache);
+      .then(async (chaptersMap) => {
+        if (chaptersMap && typeof chaptersMap === 'object' && Object.keys(chaptersMap).length > 0) {
+          ingestChaptersMap(chaptersMap);
+        } else {
+          const staticChapters = await fetchStaticBundledChapters();
+          if (staticChapters) ingestChaptersMap(staticChapters);
         }
       })
-      .catch(() => {});
+      .catch(async () => {
+        const staticChapters = await fetchStaticBundledChapters();
+        if (staticChapters) ingestChaptersMap(staticChapters);
+      });
+
+    // 2b. Firebase Realtime Database (RTDB) chapters listener
+    if (isRtdbEnabled()) {
+      const rtdb = getRtdbClient();
+      if (rtdb) {
+        try {
+          rtdbOnValue(rtdbRef(rtdb, 'chapters'), (snap) => {
+            const val = snap.val();
+            if (val && typeof val === 'object') {
+              const map: Record<string, Chapter[]> = {};
+              for (const [sId, chs] of Object.entries(val)) {
+                if (chs && typeof chs === 'object') {
+                  map[sId] = Array.isArray(chs) ? chs : (Object.values(chs) as Chapter[]);
+                }
+              }
+              ingestChaptersMap(map);
+            }
+          });
+        } catch (rtdbErr) {
+          console.warn('RTDB chapters subscribe note:', rtdbErr);
+        }
+      }
+    }
+
+    // 2c. GitHub Gist Database chapters
+    const gh = getGitHubStorageConfig();
+    if (gh.enabled && gh.gistId) {
+      fetchFromGitHubGist().then((data) => {
+        if (data && data.chapters && typeof data.chapters === 'object') {
+          ingestChaptersMap(data.chapters);
+        }
+      }).catch(() => {});
+    }
   }
 
   // 3. Listen to Firestore collection 'chapter_stats' if quota is healthy
